@@ -59,7 +59,9 @@ static struct topic *_topic_lookup(const char *name) {
   return topic;
 }
 
-static void _topic_flush(struct topic *topic) {
+static unsigned int _topic_flush(struct topic *topic) {
+  unsigned int count = 0;
+
   struct message *msg;
   while ((msg = TAILQ_FIRST(&topic->messages)) != NULL) {
     TAILQ_REMOVE(&topic->messages,msg,next);
@@ -67,11 +69,16 @@ static void _topic_flush(struct topic *topic) {
     evbuffer_free(msg->content);
     if (msg->type)
       free(msg->type);
+
     free(msg);
+
+    count += 1;
   }
 
   TAILQ_INIT(&topic->messages);
   topic->pending = NULL;
+
+  return count;
 }
 
 struct event *hup_event;
@@ -84,8 +91,11 @@ static void _flush_queues(int fd, short evt, void *arg) {
   struct topic *topic;
 
   for (topic = TAILQ_FIRST(&topics); topic; topic = topic->next.tqe_next) {
-    _topic_flush(topic);
-    printf("flushed topic '%s'\n", topic->name);
+    unsigned int count;
+
+    count = _topic_flush(topic);
+
+    printf("flushed topic '%s' %zd\n", topic->name, count);
   }
 
   printf("done\n");
@@ -193,15 +203,18 @@ static void _purge(struct evhttp_request *req, void *arg) {
   name = &purge[6];
 
   struct topic *topic;
+  unsigned int count = 0;
   for (topic = TAILQ_FIRST(&topics); topic; topic = topic->next.tqe_next) {
     if (strcmp(name, topic->name) == 0)
-      _topic_flush(topic);
+      count = _topic_flush(topic);
   }
 
-  evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Length", "0");
   evhttp_add_header(evhttp_request_get_output_headers(req), "Content-Type", "text/plain");
 
-  evhttp_send_reply(req, 200, "OK", NULL);
+  struct evbuffer *buf = evbuffer_new();
+  evbuffer_add_printf(buf, "%zd", count);
+  evhttp_send_reply(req, 200, "OK", buf);
+  evbuffer_free(buf);
 }
 
 static void _gencb(struct evhttp_request *req, void *arg) {
