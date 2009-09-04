@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <sys/queue.h>
 #include <string.h>
+#include <getopt.h>
 
 #include <event.h>
 #include <event2/http.h>
@@ -17,6 +18,7 @@
 
 struct event_base *base;
 struct evhttp *server;
+int verbose = 0;
 
 struct message {
   char *type;
@@ -42,8 +44,12 @@ static struct topic *_topic_lookup(const char *name) {
   struct topic *topic;
 
   for (topic = TAILQ_FIRST(&topics); topic; topic = topic->next.tqe_next) {
-    if (strcmp(name, topic->name) == 0)
+    if (strcmp(name, topic->name) == 0) {
+      if (verbose)
+        fprintf(stderr, "matching topic '%s' has been found\n", name);
+
       return topic;
+    }
   }
 
   topic = calloc(1, sizeof *topic);
@@ -55,6 +61,9 @@ static struct topic *_topic_lookup(const char *name) {
   TAILQ_INIT(&topic->messages);
 
   TAILQ_INSERT_TAIL(&topics, topic, next);
+
+  if (verbose)
+    fprintf(stderr, "topic '%s' has been created\n", name);
 
   return topic;
 }
@@ -85,8 +94,8 @@ struct event *hup_event;
 static void _flush_queues(int fd, short evt, void *arg) {
   assert(arg == NULL);
 
-  printf("SIGHUP received, flushing queues... \n");
-  fflush(stdout);
+  if (verbose)
+    fprintf(stderr, "SIGHUP received, flushing queues... \n");
 
   struct topic *topic;
 
@@ -95,28 +104,28 @@ static void _flush_queues(int fd, short evt, void *arg) {
 
     count = _topic_flush(topic);
 
-    printf("flushed topic '%s' %zd\n", topic->name, count);
+    if (verbose)
+      fprintf(stderr, "flushed topic '%s', which was containing %zd message(s)\n", topic->name, count);
   }
-
-  printf("done\n");
 }
 
 static void _consumer_pull(struct evhttp_request *req, void *arg) {
   assert(arg == NULL);
-
-  printf("consumer pulling ");
-  fflush(stdout);
 
   const char *name;
   char *consumer = strstr(evhttp_request_get_uri(req), "/consumer");
   assert(consumer != NULL);
   name = &consumer[9];
 
+  if (verbose)
+    fprintf(stderr, "consuming request on '%s'\n", name);
+
   struct topic *topic = _topic_lookup(name);
   assert(topic != NULL);
 
   if (TAILQ_EMPTY(&topic->messages)) {
-    printf("but empty message queue, waiting for input...\n");
+    if (verbose)
+      fprintf(stderr, "but topic is empty, put request on hold\n");
 
     evhttp_request_own(req);
     topic->pending = req;
@@ -127,7 +136,9 @@ static void _consumer_pull(struct evhttp_request *req, void *arg) {
 
     TAILQ_REMOVE(&topic->messages,msg,next);
 
-    printf(", popped %d bytes from queue\n", EVBUFFER_LENGTH(msg->content));
+    if (verbose)
+      fprintf(stderr, "preparing message of type '%s', %d bytes to be sent\n",
+        msg->type ? msg->type : "text/plain" , EVBUFFER_LENGTH(msg->content));
 
     struct evkeyvalq *headers = evhttp_request_get_output_headers(req);
     assert(headers != NULL);
@@ -135,6 +146,10 @@ static void _consumer_pull(struct evhttp_request *req, void *arg) {
     evhttp_add_header(headers, "Content-Type",
       (msg->type ? msg->type : "text/plain"));
     evhttp_send_reply(req, 200, "OK", msg->content);
+
+    if (verbose)
+      fprintf(stderr, "response embedding notification of topic '%s' sent\n",
+        name);
 
     evbuffer_free(msg->content);
     if (msg->type)
@@ -154,6 +169,9 @@ static void _producer_push(struct evhttp_request *req, void *arg) {
   assert(producer != NULL);
   name = &producer[9];
 
+  if (verbose)
+    fprintf(stderr, "producing request on '%s'\n", name);
+
   struct topic *topic = _topic_lookup(name);
   assert(topic != NULL);
 
@@ -164,17 +182,25 @@ static void _producer_push(struct evhttp_request *req, void *arg) {
   assert(type != NULL);
 
   if (topic->pending) {
+    if (verbose)
+      fprintf(stderr, "a pending consumer request was ongoing\n");
+
     struct evkeyvalq *headers = evhttp_request_get_output_headers(topic->pending);
     assert(headers != NULL);
 
     evhttp_add_header(headers, "Content-Type", type);
     evhttp_send_reply(topic->pending, 200, "OK", body);
 
+    if (verbose)
+      fprintf(stderr, "response embedding notification of topic '%s' sent\n",
+        name);
+
     topic->pending = NULL;
   }
   else {
-    printf("pushing %d bytes of data (type=%s)\n", EVBUFFER_LENGTH(body),
-      type);
+    if (verbose)
+      fprintf(stderr, "queueing a message of type '%s', %d bytes\n",
+        type, EVBUFFER_LENGTH(body));
 
     struct message *msg = calloc(1, sizeof(*msg));
     assert(msg != NULL);
@@ -190,6 +216,9 @@ static void _producer_push(struct evhttp_request *req, void *arg) {
 
     TAILQ_INSERT_TAIL(&topic->messages,msg,next);
   }
+
+  if (verbose)
+    fprintf(stderr, "response to producing request done\n");
 
   evhttp_send_reply(req, 200, "OK", NULL);
 }
@@ -232,31 +261,77 @@ static void _gencb(struct evhttp_request *req, void *arg) {
     _purge(req, NULL);
   }
   else {
-    fprintf(stderr, "unrecognized request URI '%s'\n", ruri);
+    if (verbose)
+      fprintf(stderr, "unrecognized request URI '%s', sending 404\n", ruri);
 
-    abort();
+    evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
   }
 }
 
 int main(int argc, char **argv) {
+  static struct option options[] = {
+    {"verbose", 0, 0, 'v'},
+    {"help", 0, 0, 'h'},
+    {"address", 0, 0, 'a'},
+    {"port", 0, 0, 'p'},
+    {0, 0, 0, 0}
+  };
+
   base = event_base_new();
   assert(base != NULL);
 
   server = evhttp_new(base);
   assert(server != NULL);
 
+  char *address = "0.0.0.0";
+  int port = 8888;
+
+  while (1) {
+    int c;
+
+    c = getopt_long(argc, argv, "vha:p:", options, NULL);
+    if (c == -1)
+      break;
+
+    switch (c) {
+    case 'v':
+      verbose = 1;
+      break;
+    case 'a':
+      address = optarg;
+      break;
+    case 'p':
+      port = atoi(optarg);
+      break;
+    case 'h':
+    default:
+      fprintf(stderr, "usage: %s [-v|--verbose] [-a|--address a.b.c.d] [-p|--port num]\n",
+        argv[0]);
+      exit(1);
+    }
+  }
+
   int ret;
-  ret = evhttp_bind_socket(server, "0.0.0.0", 8888);
+  ret = evhttp_bind_socket(server, address, port);
   assert(ret == 0);
+
+  if (verbose)
+    fprintf(stderr, "server bound to %s:%d\n", address, port);
 
   hup_event = evsignal_new(base, SIGHUP, _flush_queues, NULL);
   assert(hup_event != NULL);
 
   event_add(hup_event, NULL);
 
+  if (verbose)
+    fprintf(stderr, "SIGHUP bound to flush\n");
+
   evhttp_set_gencb(server, _gencb, NULL);
 
   TAILQ_INIT(&topics);
+
+  if (verbose)
+    fprintf(stderr, "entering dispatching loop, ready\n");
 
   event_base_dispatch(base);
 
