@@ -7,6 +7,9 @@ linkage will produce a dynamic binary called libevent-longpolling.
 
 run:
 execute this generated binary.
+to check that everything runs smooth, do the following:
+- consume first: wget -v http://127.0.0.1:8888/consumer/first_queue
+- then produce: curl -H "Content-Type: text/plain" -d "hello world" http://127.0.0.1:8888/producer/first_queue
 
 usage:
 users may have two distinct roles:
